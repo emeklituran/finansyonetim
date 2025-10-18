@@ -1,0 +1,12 @@
+# Sanal Ortam Klasörü - Asla Yüklenmemeli!
+venv/
+
+# Veritabanı Dosyası - Kişisel Veri İçerir, Asla Yüklenmemeli!
+finans_veritabani.db
+
+# Python'un Otomatik Oluşturduğu Geçici Dosyalar
+__pycache__/
+*.pyc
+
+# MacOS'un Otomatik Oluşturduğu Dosyalar
+.DS_Store
