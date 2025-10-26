@@ -7,31 +7,8 @@ from dateutil.relativedelta import relativedelta
 import copy
 import os
 from werkzeug.security import generate_password_hash, check_password_hash
+import io
 
-# --- GEÇİCİ ADMIN OLUŞTURMA KODU (İŞLEM SONRASI SİLİNECEK) ---
-try:
-    print("GEÇİCİ ADMIN ATAMA SCRIPTI ÇALIŞIYOR...")
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-
-    # ÖNEMLİ: 'gecici_admin' yerine 1. Adımda oluşturduğunuz kullanıcı adını yazın.
-    admin_kullanici_adi = "admin" 
-
-    cur.execute("UPDATE users SET is_admin = 1 WHERE username = ?", (admin_kullanici_adi,))
-    conn.commit()
-
-    # Kontrol için
-    cur.execute("SELECT is_admin FROM users WHERE username = ?", (admin_kullanici_adi,))
-    result = cur.fetchone()
-    if result and result[0] == 1:
-        print(f"BAŞARILI: '{admin_kullanici_adi}' kullanıcısı admin olarak atandı.")
-    else:
-        print(f"HATA: '{admin_kullanici_adi}' kullanıcısı bulunamadı veya admin yapılamadı.")
-
-    conn.close()
-except Exception as e:
-    print(f"HATA: Geçici admin atama sırasında bir sorun oluştu: {e}")
-# --- GEÇİCİ KODUN SONU ---
 # --- VERİTABANI İŞLEMLERİ ---
 DB_FILE = "finans_veritabani.db"
 
@@ -123,72 +100,106 @@ def get_all_users():
     conn.close()
     return users
 
-def calculate_payoff_plan_detailed(borclar_listesi, ekstra_odeme_gucu, gelirler_listesi, toplam_kredi_limiti):
+def format_df_for_display(df):
+    """Görüntüleme için DataFrame'i formatlar."""
+    display_df = df.copy()
+    for col in display_df.columns:
+        if '(Kalan)' in col:
+            display_df[col] = display_df[col].apply(lambda x: "🟢 TAMAMLANDI" if x == "✅ BİTTİ" else (f"{x:,.0f} TL" if isinstance(x, (int, float)) and x > 0 else ("-" if x == 0 else x)))
+        elif any(keyword in col for keyword in ['(Gelir)', '(Gider)', 'Ek Ödeme Gücü', 'Toplam Birikim']):
+            display_df[col] = display_df[col].apply(lambda x: f"{x:,.0f} TL" if isinstance(x, (int, float)) and x > 0 else "-")
+    return display_df
+
+
+def calculate_payoff_plan_detailed(borclar_listesi, ekstra_odeme_gucu, gelirler_listesi, sabit_giderler_listesi, aylik_birikim_payi, toplam_kredi_limiti):
     sim_borclar = [dict(b) for b in copy.deepcopy(borclar_listesi)]
     sim_gelirler = [dict(g) for g in copy.deepcopy(gelirler_listesi)]
-    ay_sayaci, toplam_odenen_faiz = 0, 0.0
-    grafik_verisi = {"Ay": [0], "Toplam Borç": [sum(b['balance'] for b in sim_borclar)]}
-    tablo_sutunlari = ['Ay', 'Tarih'] + [b['name'] for b in borclar_listesi] + ['Toplam Kalan Borç']
+    ay_sayaci, toplam_odenen_faiz, toplam_birikim = 0, 0.0, 0.0
+    
     tablo_verisi = []
     
     while any(b['balance'] > 0 for b in sim_borclar) and ay_sayaci < 600:
         ay_sayaci += 1
         current_date = datetime.date.today() + relativedelta(months=ay_sayaci)
-        aylik_gelir_artis = 0
+        
+        # 1. Gelirlerin Hesaplanması
+        aylik_gelir_artis, toplam_aylik_gelir = 0, 0
+        aylik_gelir_kalemleri = {}
         for gelir in sim_gelirler:
+            gelir_tutari = gelir['amount']
             if gelir['type'] == 'Maaş (Düzenli Ve Zamlı)':
                 if (gelir['raises_per_year'] == 1 and (ay_sayaci - 1) % 12 == 0 and ay_sayaci > 1) or \
                    (gelir['raises_per_year'] == 2 and (ay_sayaci - 1) % 6 == 0 and ay_sayaci > 1):
                     artis = gelir['amount'] * (gelir['raise_percentage'] / 100)
                     gelir['amount'] += artis
                     aylik_gelir_artis += artis
+                    gelir_tutari = gelir['amount']
+            
+            aylik_gelir_kalemleri[f"{gelir['name']} (Gelir)"] = gelir_tutari
+            toplam_aylik_gelir += gelir_tutari
+
         ekstra_odeme_gucu += aylik_gelir_artis
         
+        # 2. Faizlerin Hesaplanması ve Kümülatif Borçların Güncellenmesi
         kartopu_etkisi = 0
         for borc in sim_borclar:
             if borc['balance'] > 0:
-                is_active_installment = borc['type'] == 'Sabit Taksitli Borç (Okul, Senet Vb.)' and borc['first_payment_date'] and current_date >= datetime.datetime.strptime(borc['first_payment_date'], '%Y-%m-%d').date()
-                if borc['type'] != 'Sabit Taksitli Borç (Okul, Senet Vb.)' or is_active_installment:
-                    if borc['type'] != 'Sabit Taksitli Borç (Okul, Senet Vb.)':
-                        aylik_faiz = borc['balance'] * (borc['interest_rate'] / 100 / 12)
-                        borc['balance'] += aylik_faiz
-                        toplam_odenen_faiz += aylik_faiz
-                        if borc['type'] == 'KMH / Ek Hesap': borc['min_payment'] = aylik_faiz
-                        elif borc['type'] == 'Kredi Kartı': borc['min_payment'] = borc['balance'] * (0.40 if toplam_kredi_limiti > 50000 else 0.20)
-
+                # Sadece KMH ve Diğer faizli borçlarda faiz anaparaya eklenir
+                if borc['type'] in ['KMH / Ek Hesap', 'Diğer']:
+                    aylik_faiz = borc['balance'] * (borc['interest_rate'] / 100 / 12)
+                    borc['balance'] += aylik_faiz
+                    toplam_odenen_faiz += aylik_faiz
+                if borc['type'] == 'Kredi Kartı':
+                    borc['min_payment'] = borc['balance'] * (0.40 if toplam_kredi_limiti > 50000 else 0.20)
+        
+        # 3. Ödemelerin Yapılması
         odeme_gucu = ekstra_odeme_gucu
         kalan_borclar_sirali = [b for b in borclar_listesi if dict(next((sim_b for sim_b in sim_borclar if sim_b['id'] == b['id']), None))['balance'] > 0]
         hedef_borc = kalan_borclar_sirali[0] if kalan_borclar_sirali else None
 
         for borc in sim_borclar:
             if borc['balance'] > 0:
-                is_active_installment_payment = borc['type'] == 'Sabit Taksitli Borç (Okul, Senet Vb.)' and borc['first_payment_date'] and current_date >= datetime.datetime.strptime(borc['first_payment_date'], '%Y-%m-%d').date() and borc['remaining_installments'] > 0
-                if borc['type'] != 'Sabit Taksitli Borç (Okul, Senet Vb.)' or is_active_installment_payment:
-                    odenecek_asgari_orjinal = borc['min_payment']
-                    if hedef_borc and borc['id'] == hedef_borc['id']:
-                        odeme = min(borc['balance'], borc['min_payment'] + odeme_gucu)
-                    else:
-                        odeme = min(borc['balance'], borc['min_payment'])
-                    borc['balance'] -= odeme
-                    if borc['type'] == 'Sabit Taksitli Borç (Okul, Senet Vb.)' and borc['balance'] > 0: borc['remaining_installments'] -= 1
-                    if borc['balance'] <= 0: kartopu_etkisi += odenecek_asgari_orjinal
+                odenecek_asgari_orjinal = borc['min_payment']
+                if hedef_borc and borc['id'] == hedef_borc['id']:
+                    odeme = min(borc['balance'], borc['min_payment'] + odeme_gucu)
+                else:
+                    odeme = min(borc['balance'], borc['min_payment'])
+                
+                borc['balance'] -= odeme
+                
+                if borc['type'] == 'Sabit Taksitli Borç (Okul, Senet Vb.)' and borc['balance'] > 0: 
+                    borc['remaining_installments'] -= 1
+                if borc['balance'] <= 0: 
+                    kartopu_etkisi += odenecek_asgari_orjinal
 
         ekstra_odeme_gucu += kartopu_etkisi
         
-        toplam_kalan_borc = sum(b['balance'] for b in sim_borclar if b['balance'] > 0)
-        grafik_verisi["Ay"].append(ay_sayaci); grafik_verisi["Toplam Borç"].append(toplam_kalan_borc)
-        aylik_veri_satiri = [ay_sayaci, current_date.strftime("%B %Y")]
+        # 4. Birikimin Hesaplanması
+        toplam_birikim += aylik_birikim_payi
+
+        # 5. Aylık Rapor Satırının Oluşturulması
+        aylik_veri_satiri = {'Ay': ay_sayaci, 'Tarih': current_date.strftime("%B %Y")}
+        aylik_veri_satiri.update(aylik_gelir_kalemleri)
+        
+        for gider in sabit_giderler_listesi:
+            aylik_veri_satiri[f"{gider['name']} (Gider)"] = gider['amount']
+
         for b_orj in borclar_listesi:
             ilgili_borc = next((sim_b for sim_b in sim_borclar if sim_b['id'] == b_orj['id']), None)
-            if ilgili_borc and ilgili_borc['balance'] > 0: aylik_veri_satiri.append(f"{ilgili_borc['balance']:,.2f} TL")
-            else: aylik_veri_satiri.append("✅ BİTTİ")
-        aylik_veri_satiri.append(f"{toplam_kalan_borc:,.2f} TL")
+            if ilgili_borc and ilgili_borc['balance'] > 0:
+                aylik_veri_satiri[f"{b_orj['name']} (Kalan)"] = ilgili_borc['balance']
+            else:
+                aylik_veri_satiri[f"{b_orj['name']} (Kalan)"] = "✅ BİTTİ"
+        
+        aylik_veri_satiri['Ek Ödeme Gücü'] = ekstra_odeme_gucu
+        aylik_veri_satiri['Toplam Birikim'] = toplam_birikim
+        
         tablo_verisi.append(aylik_veri_satiri)
 
     if ay_sayaci >= 600: return None
-    grafik_df = pd.DataFrame(grafik_verisi).set_index("Ay")
-    tablo_df = pd.DataFrame(tablo_verisi, columns=tablo_sutunlari)
-    return ay_sayaci, toplam_odenen_faiz, grafik_df, tablo_df
+    
+    tablo_df = pd.DataFrame(tablo_verisi).fillna(0)
+    return ay_sayaci, toplam_odenen_faiz, tablo_df
 
 # --- ANA UYGULAMA MANTARI ---
 st.set_page_config(page_title="Finans Yönetim Paneli", layout="wide")
@@ -244,7 +255,7 @@ else:
 
     st.title(f"💸 {viewing_username.capitalize()}'in Finans Ve Borç Yönetim Asistanı")
     
-    tab_list = ["ℹ️ Başlarken & Yardım", "📊 Genel Durum", "➕ Yeni Kayıt Ekle", "🚀 Strateji Ve Simülasyon"]
+    tab_list = ["ℹ️ Başlarken & Yardım", "📊 Genel Durum", "➕ Yeni Kayıt Ekle", "🚀 Strateji Ve Ödeme Planı"]
     if st.session_state.is_admin: tab_list.append("👑 Admin Paneli")
     tabs = st.tabs(tab_list)
 
@@ -256,24 +267,23 @@ else:
             ### Programın Amacı Nedir?
             - **Netlik Kazanmak:** Tüm Gelir, Gider Ve Borçlarınızı Tek Bir Yerde Görerek Finansal Fotoğrafınızı Netleştirin.
             - **Strateji Oluşturmak:** 'Çığ' Ve 'Kartopu' Gibi Kanıtlanmış Yöntemlerle, Borçlarınızı En Verimli Şekilde Nasıl Kapatacağınızı Keşfedin.
-            - **Geleceği Planlamak:** Simülasyon Motoru Sayesinde, Seçtiğiniz Planla Borçlarınızın Ne Zaman Biteceğini, Ne Kadar Faizden Tasarruf Edeceğinizi Görün Ve Motive Olun.
+            - **Geleceği Planlamak:** Ödeme planı motoru sayesinde, seçtiğiniz planla borçlarınızın ne zaman biteceğini, ne kadar faizden tasarruf edeceğinizi görün ve motive olun.
 
             ### Adım Adım Kullanım Kılavuzu
             1.  **Adım: Finansal Verilerinizi Girin (Önemli!)**
                 - **`Yeni Kayıt Ekle`** Sekmesine Gidin.
-                - **Tüm Gelirlerinizi** Ekleyin. Eğer Maaş Gibi Düzenli Bir Geliriniz Varsa, "Maaş" Seçeneğini İşaretleyip Olası Yıllık Zam Oranlarınızı Girerek Simülasyonu Çok Daha Gerçekçi Hale Getirebilirsiniz.
-                - **Tüm Borçlarınızı** Ekleyin. "Kredi Kartı" Eklerken Kart Limitinizi Girmeniz Yeterlidir. "KMH" Veya "Sabit Taksitli Borç" Eklerken İlgili Alanları Doldurun. Program Gerekli Hesaplamaları Otomatik Yapar.
-                - **Sabit Giderlerinizi** (Kira, Abonelikler Vb.) Ve Aylık **Birikim Hedeflerinizi** Ekleyin. Birikim İçin Sabit Bir Tutar Veya Kalan Paranın Yüzdesi Şeklinde İki Farklı Strateji Seçebilirsiniz.
+                - **Tüm Gelirlerinizi** Ekleyin.
+                - **Tüm Borçlarınızı** Ekleyin.
+                - **Sabit Giderlerinizi** ve Aylık **Birikim Hedeflerinizi** Ekleyin.
 
             2.  **Adım: Genel Durumunuzu Gözden Geçirin**
-                - **`Genel Durum`** Sekmesine Tıklayın. Eklediğiniz Her Kaydın Yanında Bir "Sil" Butonu Bulunur.
-                - Eklediğiniz Tüm Bilgilerin Modern Bir Kart Tasarımıyla Özetlendiğini Göreceksiniz. Bu Sizin Mevcut Finansal Fotoğrafınızdır.
+                - **`Genel Durum`** Sekmesine Tıklayın. Eklediğiniz her kaydın yanında bir "Sil" butonu bulunur.
+                - Bu sizin mevcut finansal fotoğrafınızdır.
 
             3.  **Adım: Stratejinizi Oluşturun Ve Geleceği Görün**
-                - **`Strateji Ve Simülasyon`** Sekmesine Gidin.
-                - Program, Girdiğiniz Verilere Göre Elinizde Kalan "Net Fazlayı" Ve Bu Fazlanın Birikim/Borç Ödemesi Arasında Nasıl Dağıtıldığını Gösterir.
-                - "Çığ" Veya "Kartopu" Yöntemlerinden Birini Seçin Ve **"Simülasyonu Çalıştır"** Butonuna Basın.
-                - **Sonuçları İnceleyin:** Borçlarınızın Ne Zaman Biteceğini, Toplam Ne Kadar Faiz Ödeyeceğinizi, Borcunuzun Zamanla Azalışını Gösteren Grafiği Ve Ay Ay Tüm Detayları İçeren Tabloyu Görerek Geleceğinizi Planlayın!
+                - **`Strateji Ve Ödeme Planı`** Sekmesine gidin.
+                - "Çığ" veya "Kartopu" yöntemlerinden birini seçin ve **"Ödeme Planını Gör"** butonuna basın.
+                - **Sonuçları İnceleyin:** Borçlarınızın ne zaman biteceğini ve ay ay tüm detayları içeren tabloyu görerek geleceğinizi planlayın!
         """)
 
     with tabs[1]:
@@ -377,11 +387,11 @@ else:
                     else: save_record("savings", {"user_id": user_id_to_view, "name": birikim_ad, "monthly_amount": birikim_tutar, "strategy": birikim_stratejisi, "percentage": birikim_yuzde}); st.success(f"'{birikim_ad}' Hedefi Eklendi!")
 
     with tabs[3]:
-        st.header("Strateji Geliştirme Ve Simülasyon")
-        if not st.session_state.incomes or not st.session_state.debts: st.warning("Simülasyonu Çalıştırmak İçin En Az Bir Gelir Ve Bir Borç Eklemelisiniz.")
+        st.header("Strateji Geliştirme Ve Ödeme Planı")
+        if not st.session_state.incomes or not st.session_state.debts: st.warning("Ödeme planı oluşturmak için en az bir gelir ve bir borç eklemelisiniz.")
         else:
             toplam_kredi_limiti = sum(b['card_limit'] for b in st.session_state.debts if b['type'] == 'Kredi Kartı')
-            toplam_gelir = sum(g['amount'] for g in st.session_state.incomes if g['type'] != 'Tek Seferlik Gelir') + sum(g['amount'] for g in st.session_state.incomes if g['type'] == 'Tek Seferlik Gelir')
+            toplam_gelir = sum(g['amount'] for g in st.session_state.incomes if g['type'] != 'Tek Seferlik Gelir')
             toplam_sabit_giderler = sum(g['amount'] for g in st.session_state.fixed_expenses)
             borc_asgari_odemeleri = 0
             for borc in st.session_state.debts:
@@ -405,22 +415,35 @@ else:
                 col_s1, col_s2 = st.columns(2); col_s1.metric("🎯 Birikime Aktarılacak", f"{aylik_birikim_payi:,.2f} TL"); col_s2.metric("⚡️ Borç Ödemesine Aktarılacak (Ekstra Güç)", f"{borclar_icin_ekstra_guc:,.2f} TL")
             st.divider()
             if borclar_icin_ekstra_guc > 0:
-                st.subheader("Borç Ödeme Stratejisi Ve Simülasyon")
+                st.subheader("Borç Ödeme Stratejisi Ve Planı")
                 secilen_strateji = st.radio("Stratejinizi Seçin:", ("Çığ Yöntemi (En Hızlı Ve En Tasarruflu)", "Kartopu Yöntemi (En Motive Edici)"))
-                if st.button("📈 Simülasyonu Çalıştır Ve Ödeme Planını Gör"):
+                if st.button("📈 Ödeme Planını Gör"):
                     if secilen_strateji.startswith("Çığ"): sirali_borclar = sorted(st.session_state.debts, key=lambda b: b['interest_rate'], reverse=True)
                     else: sirali_borclar = sorted(st.session_state.debts, key=lambda b: b['balance'])
-                    sonuc = calculate_payoff_plan_detailed(sirali_borclar, borclar_icin_ekstra_guc, st.session_state.incomes, toplam_kredi_limiti)
+                    sonuc = calculate_payoff_plan_detailed(sirali_borclar, borclar_icin_ekstra_guc, st.session_state.incomes, st.session_state.fixed_expenses, aylik_birikim_payi, toplam_kredi_limiti)
                     if sonuc is None: st.error("Plan 50 Yıldan Uzun Sürüyor. Lütfen Verilerinizi Gözden Geçirin.")
                     else:
-                        ay_sayaci, toplam_faiz, grafik_df, tablo_df = sonuc
+                        ay_sayaci, toplam_faiz, tablo_df = sonuc
                         toplam_yil, kalan_ay = divmod(ay_sayaci, 12)
                         st.success(f"Tebrikler! Bu Plana Sadık Kalırsanız, Tüm Borçlarınız **{toplam_yil} Yıl {kalan_ay} Ay** Sonra Bitecek.")
                         st.metric("Bu Süreçte Ödeyeceğiniz Toplam Faiz", f"{toplam_faiz:,.2f} TL")
-                        st.subheader("Toplam Borcun Zamanla Azalması"); st.line_chart(grafik_df)
-                        st.subheader("Ay Ay Detaylı Ödeme Tablosu"); st.dataframe(tablo_df, use_container_width=True, hide_index=True)
+                        
+                        st.subheader("Ay Ay Detaylı Ödeme Tablosu")
+                        st.dataframe(format_df_for_display(tablo_df), use_container_width=True, hide_index=True)
+                        
+                        # Excel İndirme Butonu
+                        output = io.BytesIO()
+                        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                            tablo_df.to_excel(writer, index=False, sheet_name='Odeme_Plani')
+                        excel_data = output.getvalue()
+                        st.download_button(
+                            label="⬇️ Detaylı Tabloyu Excel Olarak İndir",
+                            data=excel_data,
+                            file_name=f"Odeme_Plani_{datetime.date.today()}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        )
             else:
-                st.error(f"Bütçenizde **{borclar_icin_ekstra_guc:,.2f} TL** Açık Var Veya Borçları Hızlandırmak İçin Ekstra Gücünüz Kalmadı. Simülasyon Çalıştırılamıyor.")
+                st.error(f"Bütçenizde **{borclar_icin_ekstra_guc:,.2f} TL** Açık Var Veya Borçları Hızlandırmak İçin Ekstra Gücünüz Kalmadı. Ödeme planı oluşturulamıyor.")
 
     if st.session_state.is_admin and len(tabs) > 4:
         with tabs[4]:
@@ -433,3 +456,10 @@ else:
                 if col2.button("Verileri Görüntüle", key=f"view_user_{user['id']}"):
                     st.session_state.viewing_user_id = user['id']
                     st.rerun()
+
+st.markdown("---")
+st.markdown("""
+<div style='text-align: center; font-size: small; color: gray;'>
+    Bu gelişmiş finansal planlama aracı, **Turan Emekli** tarafından bireysel finansal stratejileri güçlendirmek amacıyla titizlikle hazırlanmıştır.
+</div>
+""", unsafe_allow_html=True)
