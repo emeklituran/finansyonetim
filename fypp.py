@@ -8,14 +8,15 @@ import copy
 import os
 from werkzeug.security import generate_password_hash, check_password_hash
 import io
+import numpy as np
 
 # --- VERİTABANI TANIMI ---
 DB_FILE = "finans_veritabani.db"
 
-# --- VERİTABANI İŞLEMLERİ (Sadece Üye Modu için) ---
+# --- VERİTABANI İŞLEMLERİ ---
 
 def init_db():
-    # ... (Bu fonksiyon ve diğer DB fonksiyonları aynı kaldı)
+    """Veritabanını ve Tabloları Oluşturur."""
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     cur.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, is_admin INTEGER DEFAULT 0)")
@@ -46,6 +47,7 @@ def init_db():
     conn.close()
 
 def load_data(user_id):
+    """Veritabanından Sadece Belirtilen Kullanıcının Verilerini Yükler."""
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
@@ -63,7 +65,6 @@ def save_record(table, data_dict):
     cur.execute(f"INSERT INTO {table} ({columns}) VALUES ({placeholders})", list(data_dict.values()))
     conn.commit()
     conn.close()
-    load_data(st.session_state.get('viewing_user_id', st.session_state.user_id))
 
 def delete_record(table, record_id):
     conn = sqlite3.connect(DB_FILE)
@@ -72,7 +73,6 @@ def delete_record(table, record_id):
     cur.execute(f"DELETE FROM {table} WHERE id = ? AND user_id = ?", (record_id, user_id_to_check))
     conn.commit()
     conn.close()
-    # Silme sonrası session_state'i yeniden yüklemek için st.rerun yeterli olacak (ana akışta kontrol ediliyor)
 
 def add_user(username, password):
     conn = sqlite3.connect(DB_FILE)
@@ -108,11 +108,10 @@ def format_df_for_display(df):
     display_df = df.copy()
     for col in display_df.columns:
         if '(Kalan)' in col:
-            display_df[col] = display_df[col].apply(lambda x: "🟢 TAMAMLANDI" if x == "✅ BİTTİ" else (f"{x:,.0f} TL" if isinstance(x, (int, float, pd.np.number)) and x > 0 else ("-" if x == 0 else x)))
+            display_df[col] = display_df[col].apply(lambda x: "🟢 TAMAMLANDI" if x == "✅ BİTTİ" else (f"{x:,.0f} TL" if isinstance(x, (int, float, np.number)) and x > 0 else ("-" if x == 0 else x)))
         elif any(keyword in col for keyword in ['(Gelir)', '(Gider)', 'Ek Ödeme Gücü', 'Toplam Birikim']):
-            display_df[col] = display_df[col].apply(lambda x: f"{x:,.0f} TL" if isinstance(x, (int, float, pd.np.number)) and x > 0 else "-")
+            display_df[col] = display_df[col].apply(lambda x: f"{x:,.0f} TL" if isinstance(x, (int, float, np.number)) and x > 0 else "-")
     return display_df
-
 
 def calculate_payoff_plan_detailed(borclar_listesi, ekstra_odeme_gucu, gelirler_listesi, sabit_giderler_listesi, aylik_birikim_payi, toplam_kredi_limiti):
     sim_borclar = [dict(b) for b in copy.deepcopy(borclar_listesi)]
@@ -148,10 +147,10 @@ def calculate_payoff_plan_detailed(borclar_listesi, ekstra_odeme_gucu, gelirler_
         for borc in sim_borclar:
             if borc['balance'] > 0:
                 if borc['type'] in ['KMH / Ek Hesap', 'Diğer']:
-                    aylik_faiz = borc['balance'] * (borc['interest_rate'] / 100 / 12)
+                    aylik_faiz = borc['balance'] * (borc['interest_rate'] / 100) # Aylık faiz olduğu için /12 kaldırıldı
                     borc['balance'] += aylik_faiz
                     toplam_odenen_faiz += aylik_faiz
-                if borc['type'] == 'Kredi Kartı':
+                if borc['type'] == 'Kredi Kartı': 
                     borc['min_payment'] = borc['balance'] * (0.40 if toplam_kredi_limiti > 50000 else 0.20)
         
         # 3. Ödemelerin Yapılması
@@ -237,13 +236,11 @@ elif st.session_state.mode == 'guest':
     if st.button("↩️ Ana Menüye Dön"):
         del st.session_state['mode']
         st.rerun()
-    # Misafir modu için ana uygulama mantığını buraya kopyalayıp, veritabanı fonksiyonlarını session_state'e göre düzenleyeceğiz.
-    # (Şimdilik basit bir yer tutucu)
-    st.header("Misafir Planlama Paneli")
-    st.info("Bu alan, misafir kullanıcıların kayıt olmadan hızlıca plan yapabilmesi için tasarlanmıştır. Tüm sekmeler burada da aktif olacaktır, ancak verileriniz kaydedilmeyecektir.")
-    # TODO: render_debt_form, render_income_form gibi fonksiyonların misafir moduna özel versiyonları (DB olmadan) oluşturulacak.
-    
-# 3. Üye Modu Arayüzü (Mevcut Kod)
+    st.title("💸 Misafir Finans Planlama Paneli")
+    # Misafir modu için ana uygulama mantığı buraya eklenecek
+    # TODO: Misafir modu için veri ekleme/silme fonksiyonları (session_state üzerinde çalışan) oluşturulacak.
+
+# 3. Üye Modu Arayüzü
 elif st.session_state.mode == 'user':
     if 'logged_in' not in st.session_state:
         st.session_state.logged_in = False
@@ -266,6 +263,8 @@ elif st.session_state.mode == 'user':
                         user_id, is_admin = check_user(username, password)
                         if user_id:
                             st.session_state.logged_in, st.session_state.username, st.session_state.user_id, st.session_state.is_admin = True, username, user_id, is_admin
+                            # KRİTİK DÜZELTME: Giriş yapınca verileri yükle
+                            load_data(user_id)
                             st.success("Giriş Başarılı!"); st.rerun()
                         else: st.error("Kullanıcı Adı Veya Şifre Hatalı.")
         with register_tab:
@@ -412,10 +411,13 @@ elif st.session_state.mode == 'user':
                         ilk_odeme = st.date_input("İlk Ödeme Tarihi", value=datetime.date.today() + relativedelta(months=1)); borc_faiz = 0.0
                         if asgari_odeme <= 0 or taksit_sayisi <= 0: valid = False
                     else:
-                        borc_bakiye = st.number_input("Güncel Bakiye", min_value=0.01, format="%.2f"); borc_faiz = st.number_input("Yıllık Faiz Oranı (%)", min_value=0.01, format="%.2f")
-                        if borc_bakiye <= 0 or borc_faiz <= 0: valid = False
-                        if borc_tur_secim == "Kredi Kartı": kart_limiti = st.number_input("Kart Limiti", min_value=0.01, help="Bu karta ait bireysel limiti giriniz.")
-                        elif borc_tur_secim not in ["KMH / Ek Hesap"]: asgari_odeme = st.number_input("Aylık Asgari Ödeme", min_value=0.01, format="%.2f")
+                        borc_bakiye = st.number_input("Kalan Toplam Borç Bakiyesi", min_value=0.01, format="%.2f"); borc_faiz = st.number_input("Aylık Faiz Oranı (%)", min_value=0.01, format="%.2f")
+                        if borc_bakiye <= 0: valid = False
+                        if borc_tur_secim == "Kredi Kartı": 
+                            kart_limiti = st.number_input("Kart Limiti", min_value=0.01, help="Bu karta ait bireysel limiti giriniz.")
+                            asgari_odeme = 0 # KK asgari ödemesi otomatik hesaplanır
+                        elif borc_tur_secim in ["Tüketici Kredisi", "Konut Kredisi"]: 
+                            asgari_odeme = st.number_input("Aylık Taksit Tutarı", min_value=0.01, format="%.2f")
                     if st.form_submit_button("Borcu Kaydet"):
                         if not borc_ad or not valid: st.warning("Lütfen Tüm Gerekli Alanları Doldurun.")
                         else:
