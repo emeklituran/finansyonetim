@@ -8,6 +8,30 @@ import copy
 import os
 from werkzeug.security import generate_password_hash, check_password_hash
 
+# --- GEÇİCİ ADMIN OLUŞTURMA KODU (İŞLEM SONRASI SİLİNECEK) ---
+try:
+    print("GEÇİCİ ADMIN ATAMA SCRIPTI ÇALIŞIYOR...")
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+
+    # ÖNEMLİ: 'gecici_admin' yerine 1. Adımda oluşturduğunuz kullanıcı adını yazın.
+    admin_kullanici_adi = "turanemekli" 
+
+    cur.execute("UPDATE users SET is_admin = 1 WHERE username = ?", (admin_kullanici_adi,))
+    conn.commit()
+
+    # Kontrol için
+    cur.execute("SELECT is_admin FROM users WHERE username = ?", (admin_kullanici_adi,))
+    result = cur.fetchone()
+    if result and result[0] == 1:
+        print(f"BAŞARILI: '{admin_kullanici_adi}' kullanıcısı admin olarak atandı.")
+    else:
+        print(f"HATA: '{admin_kullanici_adi}' kullanıcısı bulunamadı veya admin yapılamadı.")
+
+    conn.close()
+except Exception as e:
+    print(f"HATA: Geçici admin atama sırasında bir sorun oluştu: {e}")
+# --- GEÇİCİ KODUN SONU ---
 # --- VERİTABANI İŞLEMLERİ ---
 DB_FILE = "finans_veritabani.db"
 
