@@ -9,8 +9,35 @@ import os
 from werkzeug.security import generate_password_hash, check_password_hash
 import io
 
-# --- VERİTABANI İŞLEMLERİ ---
+# --- VERİTABANI TANIMI (EN BAŞA ALINDI) ---
 DB_FILE = "finans_veritabani.db"
+
+# --- GEÇİCİ ADMIN OLUŞTURMA KODU (İŞLEM SONRASI SİLİNECEK!) ---
+# Bu blok, uygulama her yeniden başladığında çalışarak belirttiğiniz kullanıcıyı admin yapar.
+# Admin yetkisini aldıktan sonra bu bloğu SİLİP GITHUB'A TEKRAR YÜKLEYİN!
+try:
+    print("GEÇİCİ ADMIN ATAMA SCRIPTI ÇALIŞIYOR...")
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    
+    # ÖNEMLİ: 'admin' yerine admin yapmak istediğiniz KULLANICI ADINI yazın.
+    admin_kullanici_adi = "admin" 
+    
+    cur.execute("UPDATE users SET is_admin = 1 WHERE username = ?", (admin_kullanici_adi,))
+    conn.commit()
+    
+    cur.execute("SELECT is_admin FROM users WHERE username = ?", (admin_kullanici_adi,))
+    result = cur.fetchone()
+    if result and result[0] == 1:
+        print(f"BAŞARILI: '{admin_kullanici_adi}' kullanıcısı admin olarak atandı.")
+    else:
+        print(f"HATA: '{admin_kullanici_adi}' kullanıcısı bulunamadı veya admin yapılamadı.")
+        
+    conn.close()
+except Exception as e:
+    print(f"HATA: Geçici admin atama sırasında bir sorun oluştu: {e}")
+# --- GEÇİCİ KODUN SONU ---
+
 
 def init_db():
     """Veritabanını Ve Tabloları Oluşturur."""
@@ -105,9 +132,9 @@ def format_df_for_display(df):
     display_df = df.copy()
     for col in display_df.columns:
         if '(Kalan)' in col:
-            display_df[col] = display_df[col].apply(lambda x: "🟢 TAMAMLANDI" if x == "✅ BİTTİ" else (f"{x:,.0f} TL" if isinstance(x, (int, float)) and x > 0 else ("-" if x == 0 else x)))
+            display_df[col] = display_df[col].apply(lambda x: "🟢 TAMAMLANDI" if x == "✅ BİTTİ" else (f"{x:,.0f} TL" if isinstance(x, (int, float, np.number)) and x > 0 else ("-" if x == 0 else x)))
         elif any(keyword in col for keyword in ['(Gelir)', '(Gider)', 'Ek Ödeme Gücü', 'Toplam Birikim']):
-            display_df[col] = display_df[col].apply(lambda x: f"{x:,.0f} TL" if isinstance(x, (int, float)) and x > 0 else "-")
+            display_df[col] = display_df[col].apply(lambda x: f"{x:,.0f} TL" if isinstance(x, (int, float, np.number)) and x > 0 else "-")
     return display_df
 
 
@@ -144,7 +171,6 @@ def calculate_payoff_plan_detailed(borclar_listesi, ekstra_odeme_gucu, gelirler_
         kartopu_etkisi = 0
         for borc in sim_borclar:
             if borc['balance'] > 0:
-                # Sadece KMH ve Diğer faizli borçlarda faiz anaparaya eklenir
                 if borc['type'] in ['KMH / Ek Hesap', 'Diğer']:
                     aylik_faiz = borc['balance'] * (borc['interest_rate'] / 100 / 12)
                     borc['balance'] += aylik_faiz
