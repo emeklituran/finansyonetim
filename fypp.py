@@ -99,6 +99,18 @@ def get_all_users():
     conn.close()
     return users
 
+# --- YENİ MİSAFİR MODU FONKSİYONLARI ---
+def guest_save_record(category, data_dict):
+    """Misafir modunda verileri session_state'e kaydeder."""
+    st.session_state.guest_id_counter += 1
+    data_dict['id'] = st.session_state.guest_id_counter
+    st.session_state[category].append(data_dict)
+
+def guest_delete_record(category, record_id):
+    """Misafir modunda verileri session_state'ten siler."""
+    st.session_state[category] = [item for item in st.session_state[category] if item['id'] != record_id]
+
+
 # --- HESAPLAMA VE GÖRSELLEŞTİRME FONKSİYONLARI ---
 
 def format_df_for_display(df):
@@ -113,8 +125,8 @@ def format_df_for_display(df):
 
 
 def calculate_payoff_plan_detailed(borclar_listesi, ekstra_odeme_gucu, gelirler_listesi, sabit_giderler_listesi, aylik_birikim_payi, toplam_kredi_limiti):
-    sim_borclar = copy.deepcopy(borclar_listesi)
-    sim_gelirler = copy.deepcopy(gelirler_listesi)
+    sim_borclar = [dict(b) for b in copy.deepcopy(borclar_listesi)]
+    sim_gelirler = [dict(g) for g in copy.deepcopy(gelirler_listesi)]
     ay_sayaci, toplam_odenen_faiz, toplam_birikim = 0, 0.0, 0.0
     
     tablo_verisi = []
@@ -123,6 +135,7 @@ def calculate_payoff_plan_detailed(borclar_listesi, ekstra_odeme_gucu, gelirler_
         ay_sayaci += 1
         current_date = datetime.date.today() + relativedelta(months=ay_sayaci)
         
+        # 1. Gelirlerin Hesaplanması
         aylik_gelir_artis, toplam_aylik_gelir = 0, 0
         aylik_gelir_kalemleri = {}
         for gelir in sim_gelirler:
@@ -140,6 +153,7 @@ def calculate_payoff_plan_detailed(borclar_listesi, ekstra_odeme_gucu, gelirler_
 
         ekstra_odeme_gucu += aylik_gelir_artis
         
+        # 2. Faizlerin Hesaplanması ve Kümülatif Borçların Güncellenmesi
         kartopu_etkisi = 0
         for borc in sim_borclar:
             if borc['balance'] > 0:
@@ -150,6 +164,7 @@ def calculate_payoff_plan_detailed(borclar_listesi, ekstra_odeme_gucu, gelirler_
                 if borc['type'] == 'Kredi Kartı': 
                     borc['min_payment'] = borc['balance'] * (0.40 if toplam_kredi_limiti > 50000 else 0.20)
         
+        # 3. Ödemelerin Yapılması
         odeme_gucu = ekstra_odeme_gucu
         kalan_borclar_sirali = [b for b in borclar_listesi if dict(next((sim_b for sim_b in sim_borclar if sim_b['id'] == b['id']), None))['balance'] > 0]
         hedef_borc = kalan_borclar_sirali[0] if kalan_borclar_sirali else None
@@ -171,8 +186,10 @@ def calculate_payoff_plan_detailed(borclar_listesi, ekstra_odeme_gucu, gelirler_
 
         ekstra_odeme_gucu += kartopu_etkisi
         
+        # 4. Birikimin Hesaplanması
         toplam_birikim += aylik_birikim_payi
 
+        # 5. Aylık Rapor Satırının Oluşturulması
         aylik_veri_satiri = {'Ay': ay_sayaci, 'Tarih': current_date.strftime("%B %Y")}
         aylik_veri_satiri.update(aylik_gelir_kalemleri)
         
@@ -231,7 +248,48 @@ elif st.session_state.mode == 'guest':
         del st.session_state['mode']
         st.rerun()
     st.title("💸 Misafir Finans Planlama Paneli")
-    # ... Misafir modu için arayüz (aşağıda)
+    
+    # Misafir modu için ana uygulama mantığı
+    tab_list = ["ℹ️ Başlarken & Yardım", "📊 Genel Durum", "➕ Yeni Kayıt Ekle", "🚀 Strateji Ve Ödeme Planı"]
+    tabs = st.tabs(tab_list)
+
+    with tabs[0]:
+        st.header("Programa Hoş Geldiniz!")
+        st.markdown("...") # Yardım metnini buraya ekleyebilirsiniz
+
+    with tabs[1]:
+        st.header("Finansal Gösterge Paneli")
+        col1, col2 = st.columns(2)
+        with col1:
+            with st.container(border=True):
+                st.subheader("💰 Gelirler")
+                if not st.session_state.incomes: st.info("Gelir Eklenmemiş.")
+                for income in st.session_state.incomes:
+                    st.markdown(f"**{income['name']}:** `{income['amount']:,.2f} TL`")
+                    if st.button(f"Sil##gelir{income['id']}", key=f"del_gelir_{income['id']}"): 
+                        guest_delete_record("incomes", income['id'])
+                        st.rerun()
+        # ... Diğer gösterge paneli elemanları ...
+    
+    with tabs[2]:
+        st.header("Veri Giriş Formları")
+        with st.expander("Yeni Gelir Ekle", expanded=True):
+            with st.form("guest_gelir_form", clear_on_submit=True):
+                gelir_ad = st.text_input("Gelir Kaynağının Adı")
+                gelir_tutar = st.number_input("Tutar", min_value=0.01, format="%.2f")
+                if st.form_submit_button("Geliri Kaydet"):
+                    if not gelir_ad or gelir_tutar <= 0: st.warning("Lütfen Tüm Alanları Doldurun.")
+                    else:
+                        guest_save_record("incomes", {"name": gelir_ad, "amount": gelir_tutar, "type": "Diğer Düzenli Gelir (Zamsız)"}); st.success(f"'{gelir_ad}' Eklendi!")
+        # ... Diğer misafir veri giriş formları ...
+    
+    with tabs[3]:
+        st.header("Strateji Geliştirme Ve Ödeme Planı")
+        if not st.session_state.incomes or not st.session_state.debts: st.warning("Ödeme planı oluşturmak için en az bir gelir ve bir borç eklemelisiniz.")
+        else:
+            # ... Misafir modu için planlama mantığı ...
+            pass
+
 
 # 3. Üye Modu Arayüzü
 elif st.session_state.mode == 'user':
