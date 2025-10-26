@@ -15,7 +15,7 @@ try:
     cur = conn.cursor()
 
     # ÖNEMLİ: 'gecici_admin' yerine 1. Adımda oluşturduğunuz kullanıcı adını yazın.
-    admin_kullanici_adi = "turanemekli" 
+    admin_kullanici_adi = "admin" 
 
     cur.execute("UPDATE users SET is_admin = 1 WHERE username = ?", (admin_kullanici_adi,))
     conn.commit()
